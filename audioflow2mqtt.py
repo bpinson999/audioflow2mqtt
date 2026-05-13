@@ -29,6 +29,7 @@ if config_file:
     DEVICE_IPS = gen['devices'] if 'devices' in gen else None
     LOG_LEVEL = gen['log_level'].upper() if 'log_level' in gen else 'INFO'
     DISCOVERY_PORT = gen['discovery_port'] if 'discovery_port' in gen else 54321
+    HEALTH_CHECK_PORT = gen['health_check_port'] if 'health_check_port' in gen else 8080
 
 else:
     MQTT_HOST = os.getenv('MQTT_HOST', None)
@@ -41,6 +42,7 @@ else:
     DEVICE_IPS = os.getenv('DEVICE_IPS') if os.getenv('DEVICE_IPS') != None else os.getenv('DEVICES')
     LOG_LEVEL = os.getenv('LOG_LEVEL', 'INFO').upper()
     DISCOVERY_PORT = int(os.getenv('DISCOVERY_PORT', 54321))
+    HEALTH_CHECK_PORT = int(os.getenv('HEALTH_CHECK_PORT', 8080))
 
 class NetworkDiscovery:
     def __init__(self):
@@ -125,6 +127,7 @@ class AudioflowDevice:
             self.devices[serial_no]['zones'] = {}
             self.devices[serial_no]['switch_names'] = []
             self.devices[serial_no]['retry_count'] = 0
+            self.devices[serial_no]['last_poll_success'] = asyncio.get_event_loop().time()
             self.serial_nos.append(serial_no)
 
             for item in device_info:
@@ -163,6 +166,7 @@ class AudioflowDevice:
                 device_info = await httpx_async.get(url=device_url + 'switch', timeout=self.timeout)    
             except Exception as e:
                 logging.error(f'Unable to get network info: {e}')
+                return
             device_info = json.loads(device_info.text)
             wifi = device_info['wifi']
             ssid = wifi[:wifi.find('[')].strip()
@@ -207,6 +211,7 @@ class AudioflowDevice:
             if retry_count > 0:
                 logging.info(f'Reconnected to Audioflow device at {ip}.')
             self.devices[serial_no]['retry_count'] = 0
+            self.devices[serial_no]['last_poll_success'] = asyncio.get_event_loop().time()
             if m.mqtt_connected:
                 await client.publish(f'{BASE_TOPIC}/{serial_no}/status', 'online', qos=MQTT_QOS, retain=True)
         except Exception as e:
@@ -288,6 +293,17 @@ class AudioflowDevice:
             except Exception as e:
                 logging.error(f'Enable/disable zone for device at {ip} failed: {e}')
 
+    async def reboot_device(self, serial_no):
+        """Reboot the Audioflow device"""
+        device_url = self.devices[serial_no]['device_url']
+        ip = self.devices[serial_no]['ip_addr']
+        try:
+            async with httpx.AsyncClient() as httpx_async:
+                await httpx_async.get(url=device_url + 'reboot_now', timeout=self.timeout)
+            logging.info(f'Reboot command sent to Audioflow device at {ip}.')
+        except Exception as e:
+            logging.error(f'Reboot command for device at {ip} failed: {e}')
+
     async def poll_device_state(self, serial_no, httpx_async):
         """Poll for Audioflow device information every 10 seconds in case button(s) is/are pressed on device"""
         while True:
@@ -364,6 +380,27 @@ class AudioflowDevice:
                             'platform': 'mqtt'
                             }), qos=1, retain=True)
 
+                # HA button entity - reboot
+                await client.publish(f'{ha_button}{serial_no}/reboot/config', json.dumps({
+                    'availability': [
+                        {'topic': f'{BASE_TOPIC}/status'},
+                        {'topic': f'{BASE_TOPIC}/{serial_no}/status'}
+                    ],
+                    'name': 'Reboot',
+                    'default_entity_id': f'button.reboot_{serial_no}',
+                    'command_topic': f'{BASE_TOPIC}/{serial_no}/reboot',
+                    'payload_press': 'reboot',
+                    'unique_id': f'{serial_no}_reboot',
+                    'icon': 'mdi:restart',
+                    'device': {
+                        'name': f'{name}',
+                        'identifiers': f'{serial_no}',
+                        'manufacturer': 'Audioflow',
+                        'model': f'{model}',
+                        'sw_version': f'{fw_version}'},
+                    'platform': 'mqtt'
+                }), qos=1, retain=True)
+
                 # HA sensor entities
                 network_info_names = {
                                         'ssid': {'name': 'SSID', 'icon': 'mdi:access-point-network'},
@@ -438,7 +475,7 @@ class Mqtt:
             async for msg in client.messages:
                 payload = msg.payload.decode('utf-8')
                 topic = str(msg.topic)
-                serial_no = topic[topic.find(BASE_TOPIC)+len(BASE_TOPIC)+1:topic.find('/set')]
+                serial_no = topic.split('/')[1]
                 switch_no = topic[-1:]
                 if 'set_zone_state' in topic:
                     if topic.endswith('e'): # if no zone number is present in topic
@@ -447,6 +484,8 @@ class Mqtt:
                         await d.set_zone_state(serial_no, switch_no, payload)
                 elif 'set_zone_enable' in topic:
                     await d.set_zone_enable(serial_no, switch_no, payload)
+                elif topic.endswith('/reboot'):
+                    await d.reboot_device(serial_no)
         except aiomqtt.MqttError:
             self.mqtt_connected = False
 
@@ -475,11 +514,54 @@ class Mqtt:
 
 m = Mqtt()
 
+async def health_check_server():
+    """Minimal HTTP server for Docker health checks on HEALTH_CHECK_PORT"""
+    async def handle(reader, writer):
+        try:
+            await reader.read(1024)
+            issues = []
+            if not m.mqtt_connected:
+                issues.append('MQTT disconnected')
+            now = asyncio.get_event_loop().time()
+            for serial_no in d.serial_nos:
+                last_poll = d.devices[serial_no].get('last_poll_success')
+                if last_poll is not None and now - last_poll > 30:
+                    ip = d.devices[serial_no]['ip_addr']
+                    issues.append(f'Device {serial_no} ({ip}) unreachable')
+            if issues:
+                status_line = 'HTTP/1.1 503 Service Unavailable'
+                body = '\n'.join(issues)
+            else:
+                status_line = 'HTTP/1.1 200 OK'
+                body = 'OK'
+            body_bytes = body.encode()
+            response = (
+                f'{status_line}\r\n'
+                f'Content-Type: text/plain\r\n'
+                f'Content-Length: {len(body_bytes)}\r\n'
+                f'Connection: close\r\n'
+                f'\r\n'
+            ).encode() + body_bytes
+            writer.write(response)
+            await writer.drain()
+        finally:
+            writer.close()
+
+    server = await asyncio.start_server(handle, '0.0.0.0', HEALTH_CHECK_PORT)
+    logging.info(f'Health check endpoint listening on port {HEALTH_CHECK_PORT}')
+    async with server:
+        await server.serve_forever()
+
 async def main():
     if LOG_LEVEL.lower() not in ['debug', 'info', 'warning', 'error']:
         logging.warning(f'Selected log level "{LOG_LEVEL}" is not valid; using default (info)')
     else:
         logging.basicConfig(level=LOG_LEVEL, format='%(asctime)s %(levelname)s: %(message)s')
+        if LOG_LEVEL != 'DEBUG':
+            class _HttpxGetFilter(logging.Filter):
+                def filter(self, record):
+                    return 'HTTP Request: GET ' not in record.getMessage()
+            logging.getLogger('httpx').addFilter(_HttpxGetFilter())
 
     logging.info(f'=== audioflow2mqtt version {version} started ===')
 
@@ -531,7 +613,8 @@ async def main():
         m.mqtt_init(),
         *device_state_polling,
         *network_info_polling,
-        m.mqtt_reconnect()
+        m.mqtt_reconnect(),
+        health_check_server()
     )
 
 if __name__ == '__main__':
